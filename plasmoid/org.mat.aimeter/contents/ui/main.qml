@@ -333,7 +333,10 @@ PlasmoidItem {
                     }
 
                     ColumnLayout {
-                        Layout.preferredWidth: Kirigami.Units.gridUnit * 5.4
+                        id: barsCol
+                        // Widest bar label in this meter, so "Models"/"Other" don't collide with the bar.
+                        property real maxLabel: 0
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 4.5 + maxLabel
                         Layout.fillHeight: true
                         spacing: 2
 
@@ -343,6 +346,8 @@ PlasmoidItem {
                                 required property var modelData
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
+                                labelWidth: barsCol.maxLabel
+                                onLabelImplicitWidthChanged: barsCol.maxLabel = Math.max(barsCol.maxLabel, labelImplicitWidth)
                                 label: Plasmoid.configuration.showWindowLabels ? modelData.label : ""
                                 pct: modelData.pct
                                 resetAt: modelData.reset_at
@@ -420,7 +425,15 @@ PlasmoidItem {
                         opacity: 0.8
                         font.pixelSize: Kirigami.Units.gridUnit * 0.82
                     }
-                    Item { Layout.fillWidth: true }
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        opacity: 0.55
+                        font.pixelSize: Kirigami.Units.gridUnit * 0.72
+                        text: barBlock.modelData.fresh
+                            ? "unused"
+                            : Logic.resetText(barBlock.modelData.reset_at, root.now)
+                    }
                     PlasmaComponents.Label {
                         text: barBlock.modelData.pct === null ? "—" : Math.round(barBlock.modelData.pct) + "%"
                         font.bold: true
@@ -438,24 +451,17 @@ PlasmoidItem {
                     win: barBlock.modelData.win
                     fresh: barBlock.modelData.fresh === true
                 }
-
-                PlasmaComponents.Label {
-                    Layout.fillWidth: true
-                    opacity: 0.6
-                    font.pixelSize: Kirigami.Units.gridUnit * 0.72
-                    text: barBlock.modelData.fresh
-                        ? "unused"
-                        : Logic.resetText(barBlock.modelData.reset_at, root.now)
-                }
             }
         }
     }
 
     fullRepresentation: Item {
         Layout.minimumWidth: Kirigami.Units.gridUnit * 20
-        Layout.minimumHeight: Kirigami.Units.gridUnit * 16
+        // Minimum tracks the content (capped) so a remembered small popup size can't force scrolling.
+        Layout.minimumHeight: Math.min(Kirigami.Units.gridUnit * 56,
+            Math.max(Kirigami.Units.gridUnit * 16, sectionsCol.implicitHeight + Kirigami.Units.gridUnit * 6))
         Layout.preferredWidth: Kirigami.Units.gridUnit * 22
-        Layout.preferredHeight: Kirigami.Units.gridUnit * Math.min(34, 10 + root.meters.length * 7)
+        Layout.preferredHeight: Layout.minimumHeight
 
         ColumnLayout {
             anchors.fill: parent
@@ -501,7 +507,9 @@ PlasmoidItem {
                 contentWidth: availableWidth
 
                 ColumnLayout {
-                    width: parent.width
+                    id: sectionsCol
+                    // Keep bar ends clear of the scrollbar.
+                    width: parent.width - Kirigami.Units.gridUnit
                     spacing: Kirigami.Units.largeSpacing
 
                     Repeater {
