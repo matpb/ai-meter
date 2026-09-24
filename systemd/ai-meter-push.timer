@@ -1,0 +1,10 @@
+[Unit]
+Description=ai-meter push timer
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=120s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

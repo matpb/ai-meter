@@ -1,0 +1,53 @@
+{
+  "v": 2,
+  "ts": 1790270278,
+  "meters": [
+    {
+      "id": "claude-1", "type": "claude", "label": "Claude", "sub": "Personal",
+      "panel": true, "phone": true, "icon": "",
+      "ok": true, "source": "token", "age": 0, "plan": null, "reason": null,
+      "bars": [
+        { "k": "5h", "label": "5h", "pct": 34, "reset_at": 1790277478, "fresh": false, "win": 18000 },
+        { "k": "7d", "label": "7d", "pct": 61, "reset_at": 1790451718, "fresh": false, "win": 604800 },
+        { "k": "model", "label": "Fable", "pct": 22, "reset_at": 1790670278, "fresh": false, "win": 604800 }
+      ]
+    },
+    {
+      "id": "claude-2", "type": "claude", "label": "Claude", "sub": "Work",
+      "panel": false, "phone": true, "icon": "",
+      "ok": true, "source": "token", "age": 12, "plan": null, "reason": null,
+      "bars": [
+        { "k": "5h", "label": "5h", "pct": 8, "reset_at": 1790285278, "fresh": false, "win": 18000 },
+        { "k": "7d", "label": "7d", "pct": 40, "reset_at": 1790570278, "fresh": false, "win": 604800 }
+      ]
+    },
+    {
+      "id": "codex-1", "type": "codex", "label": "Codex", "sub": null,
+      "panel": true, "phone": true, "icon": "",
+      "ok": true, "source": "token", "age": 0, "plan": "plus", "reason": null,
+      "bars": [
+        { "k": "5h", "label": "5h", "pct": 96, "reset_at": 1790270458, "fresh": false, "win": 18000 },
+        { "k": "7d", "label": "7d", "pct": 15, "reset_at": 1790770278, "fresh": false, "win": 604800 }
+      ]
+    },
+    {
+      "id": "grok-1", "type": "grok", "label": "Grok", "sub": null,
+      "panel": false, "phone": false, "icon": "",
+      "ok": true, "source": "token", "age": 300, "plan": null, "reason": null,
+      "bars": [
+        { "k": "cli", "label": "CLI", "pct": 12, "reset_at": 1790520278, "fresh": false, "win": 604800 },
+        { "k": "7d", "label": "7d", "pct": 30, "reset_at": 1790670278, "fresh": false, "win": 604800 }
+      ]
+    },
+    {
+      "id": "cursor-1", "type": "cursor", "label": "Cursor", "sub": null,
+      "panel": false, "phone": false, "icon": "",
+      "ok": true, "source": "token", "age": 60, "plan": null, "reason": null,
+      "bars": [
+        { "k": "models", "label": "Models", "pct": 55, "reset_at": 1791470278, "fresh": false, "win": 2592000 },
+        { "k": "other", "label": "Other", "pct": 5, "reset_at": 1791470278, "fresh": false, "win": 2592000 },
+        { "k": "grok", "label": "Grok", "pct": 0, "reset_at": 1790770278, "fresh": true, "win": 604800 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+# Android build outputs and local machine config
+android/**/build/
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/.idea/
+android/app/google-services.json
+*.iml
+*.apk
+
+# Secrets and runtime state that must never be published
+*service-account*.json
+push.json
+snapshot.json
+
+.idea/
+*.tmp
+*.bak
+*.log
+*~
+.DS_Store

@@ -1,0 +1,596 @@
+#!/usr/bin/env bash
+# ai-meter — collects AI subscription usage from provider scripts into one snapshot,
+# manages config, and pushes a compact payload to FCM. See docs/contract.md.
+set -uo pipefail
+
+SELF_PATH="$(readlink -f "$0")"
+COLLECTOR_DIR="$(dirname "$SELF_PATH")"
+PROVIDERS_DIR="${AI_METER_PROVIDERS:-$COLLECTOR_DIR/providers}"
+
+CONFIG_FILE="${AI_METER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-meter/config.json}"
+PUSH_CONFIG_FILE="${AI_METER_PUSH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-meter/push.json}"
+STATE_DIR="${AI_METER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ai-meter}"
+SNAPSHOT_FILE="$STATE_DIR/snapshot.json"
+META_FILE="$STATE_DIR/snapshot.meta.json"
+LOCK_FILE="$STATE_DIR/collect.lock"
+LAST_GOOD_DIR="$STATE_DIR/last-good"
+PUSH_STATE_FILE="$STATE_DIR/push-state.json"
+TOKEN_CACHE_FILE="$STATE_DIR/fcm-token.json"
+
+CURL="${AI_METER_CURL:-curl}"
+TIMEOUT_S="${AI_METER_TIMEOUT:-40}"
+
+# ---------- jq: provider JSON -> unfiltered bars array, per docs/contract.md's bar table ----------
+JQ_BARS_PROGRAM=$(cat <<'JQEOF'
+def round: if . == null then null else (. + (if . >= 0 then 0.5 else -0.5 end) | floor) end;
+def mkbar($k; $label; $src; $win):
+  if $src == null then empty
+  else { k: $k, label: $label,
+         pct:      (if ($src.pct == null) then null else ($src.pct | round) end),
+         reset_at: (if ($src.reset_in == null) then null else ($now + $src.reset_in) end),
+         fresh:    ($src.fresh // false),
+         win:      $win }
+  end;
+if $type == "claude" then
+  [ mkbar("5h"; "5h"; $d.five; 18000),
+    mkbar("7d"; "7d"; $d.seven; 604800),
+    (if $d.model == null then empty else mkbar("model"; ($d.model.name // "model"); $d.model; 604800) end) ]
+elif $type == "codex" then
+  [ mkbar("5h"; "5h"; $d.five; 18000), mkbar("7d"; "7d"; $d.seven; 604800) ]
+elif $type == "grok" then
+  [ mkbar("cli"; "CLI"; $d.five; 604800), mkbar("7d"; "7d"; $d.seven; 604800) ]
+elif $type == "cursor" then
+  ($d.cycle_sec // 2592000) as $wc
+  | [ mkbar("models"; "Models"; $d.five; $wc), mkbar("other"; "Other"; $d.seven; $wc),
+      (if $d.grok == null then empty else mkbar("grok"; "Grok"; $d.grok; ($d.grok.week_sec // 604800)) end) ]
+else [] end
+JQEOF
+)
+
+log_err() { printf '%s\n' "$*" >&2; }
+
+# ---------- atomic write: temp file in the same dir as the target, then mv ----------
+atomic_write() {
+  local path="$1" mode="${2:-0644}"
+  local dir; dir=$(dirname "$path")
+  mkdir -p "$dir" 2>/dev/null
+  local tmp; tmp=$(mktemp "$dir/.mb.XXXXXX")
+  cat > "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+mkdir_state() {
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  mkdir -p "$LAST_GOOD_DIR" 2>/dev/null
+}
+
+# ================= config =================
+
+auto_detect_config() {
+  local meters="[]"
+
+  local has_claude="false"
+  [ -f "$HOME/.claude/.credentials.json" ] && has_claude="true"
+  local cookie_paths=(
+    "$HOME/.config/google-chrome/Default/Cookies"
+    "$HOME/.config/chromium/Default/Cookies"
+    "$HOME/.config/BraveSoftware/Brave-Browser/Default/Cookies"
+    "$HOME/.config/vivaldi/Default/Cookies"
+  )
+  local cp
+  for cp in "${cookie_paths[@]}"; do
+    [ -f "$cp" ] && has_claude="true"
+  done
+  if [ "$has_claude" = "true" ]; then
+    meters=$(jq -c '. + [{"id":"claude-1","type":"claude","label":"Claude","sub":"","panel":true,"phone":true,"hide":["model"],"icon":"","opts":{"claudeDir":"","cookiesPath":""}}]' <<<"$meters")
+  fi
+
+  if [ -f "$HOME/.codex/auth.json" ]; then
+    meters=$(jq -c '. + [{"id":"codex-1","type":"codex","label":"Codex","sub":"","panel":true,"phone":true,"hide":["model"],"icon":"","opts":{"codexHome":""}}]' <<<"$meters")
+  fi
+
+  if [ -d "$HOME/.grok" ]; then
+    meters=$(jq -c '. + [{"id":"grok-1","type":"grok","label":"Grok","sub":"","panel":true,"phone":true,"hide":["model"],"icon":"","opts":{"grokHome":""}}]' <<<"$meters")
+  fi
+
+  local has_cursor="false"
+  [ -f "$HOME/.config/cursor/auth.json" ] && has_cursor="true"
+  [ -f "$HOME/.config/Cursor/User/globalStorage/state.vscdb" ] && has_cursor="true"
+  if [ "$has_cursor" = "true" ]; then
+    meters=$(jq -c '. + [{"id":"cursor-1","type":"cursor","label":"Cursor","sub":"","panel":true,"phone":true,"hide":["model"],"icon":"","opts":{}}]' <<<"$meters")
+  fi
+
+  jq -n --argjson meters "$meters" '{v: 1, meters: $meters}'
+}
+
+# Content to hash / parse for collection: raw file bytes if present, else the resolved auto-detect JSON.
+config_get_effective() {
+  if [ -f "$CONFIG_FILE" ]; then
+    cat "$CONFIG_FILE"
+  else
+    auto_detect_config
+  fi
+}
+
+config_get() {
+  if [ -f "$CONFIG_FILE" ]; then
+    cat "$CONFIG_FILE"
+  else
+    auto_detect_config
+  fi
+}
+
+# Prints an error string on invalid input, nothing on success.
+validate_config_json() {
+  local json="$1"
+  if ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+    echo "invalid JSON"; return
+  fi
+  local v; v=$(printf '%s' "$json" | jq -r '.v // empty' 2>/dev/null)
+  if [ "$v" != "1" ]; then echo "unsupported config version (want v:1)"; return; fi
+  local is_array; is_array=$(printf '%s' "$json" | jq -r '(.meters | type) == "array"' 2>/dev/null)
+  if [ "$is_array" != "true" ]; then echo "meters must be an array"; return; fi
+
+  printf '%s' "$json" | jq -r '
+    .meters as $m
+    | (["claude","codex","grok","cursor"]) as $types
+    | ($m | map(select(.type as $t | ($types | index($t)) | not)) | first) as $bad
+    | ($m | map(.id // "")) as $ids
+    | ($ids | map(select(test("^[a-z0-9-]+$") | not)) | first) as $badid
+    | ($ids | group_by(.) | map(select(length > 1)) | (first // [null])[0]) as $dupid
+    | if $bad != null then "invalid type: " + (($bad.type // "null") | tostring)
+      elif $badid != null then "invalid id: " + $badid
+      elif $dupid != null then "duplicate id: " + $dupid
+      else empty end
+  ' 2>/dev/null
+}
+
+do_config_set() {
+  local b64="$1"
+  local json
+  if [ -n "$b64" ]; then
+    json=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
+    if [ -z "$json" ]; then
+      log_err "config set: invalid base64"
+      exit 2
+    fi
+  else
+    json=$(cat)
+  fi
+
+  local err; err=$(validate_config_json "$json")
+  if [ -n "$err" ]; then
+    log_err "config set: $err"
+    exit 2
+  fi
+
+  mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null
+  chmod 700 "$(dirname "$CONFIG_FILE")" 2>/dev/null || true
+  printf '%s' "$json" | atomic_write "$CONFIG_FILE" 0600
+}
+
+do_config_init() {
+  mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null
+  chmod 700 "$(dirname "$CONFIG_FILE")" 2>/dev/null || true
+  if [ -f "$CONFIG_FILE" ]; then
+    cat "$CONFIG_FILE"
+    return 0
+  fi
+  local json; json=$(auto_detect_config)
+  printf '%s' "$json" | atomic_write "$CONFIG_FILE" 0600
+  printf '%s\n' "$json"
+}
+
+# ================= collection =================
+
+# Runs one provider in the background with per-invocation env; writes <outbase>.out/.err/.rc.
+launch_provider() {
+  local type="$1" opts_json="$2" outbase="$3"
+  (
+    local -a envs=()
+    case "$type" in
+      claude)
+        local d c
+        d=$(jq -r '.claudeDir // ""' <<<"$opts_json")
+        c=$(jq -r '.cookiesPath // ""' <<<"$opts_json")
+        d="${d/#\~/$HOME}"; c="${c/#\~/$HOME}"
+        [ -n "$d" ] && envs+=("CLAUDE_USAGE_DIR=$d/usage")
+        if [ -n "$c" ]; then
+          envs+=("CLAUDE_CHROME_COOKIES=$c")
+        elif [ -n "$d" ]; then
+          # claudeDir set, no explicit cookie DB: never let the browser rung read another account.
+          envs+=("CLAUDE_CHROME_COOKIES=/nonexistent")
+        fi
+        ;;
+      codex)
+        local h; h=$(jq -r '.codexHome // ""' <<<"$opts_json"); h="${h/#\~/$HOME}"
+        [ -n "$h" ] && envs+=("CODEX_HOME=$h")
+        ;;
+      grok)
+        local h; h=$(jq -r '.grokHome // ""' <<<"$opts_json"); h="${h/#\~/$HOME}"
+        [ -n "$h" ] && envs+=("GROK_HOME=$h")
+        ;;
+      *) ;;
+    esac
+    local script="$PROVIDERS_DIR/$type.sh"
+    if [ "${#envs[@]}" -gt 0 ]; then
+      env "${envs[@]}" timeout "${TIMEOUT_S}s" bash "$script" >"$outbase.out" 2>"$outbase.err"
+    else
+      timeout "${TIMEOUT_S}s" bash "$script" >"$outbase.out" 2>"$outbase.err"
+    fi
+    echo "$?" > "$outbase.rc"
+  ) &
+}
+
+# Builds the final meter object for the snapshot, updating last-good state as a side effect.
+process_meter() {
+  local meter_json="$1" outbase="$2" now="$3"
+  local id type label sub_raw panel phone icon hide_json
+  id=$(jq -r '.id' <<<"$meter_json")
+  type=$(jq -r '.type' <<<"$meter_json")
+  label=$(jq -r '.label // ""' <<<"$meter_json")
+  sub_raw=$(jq -r '.sub // ""' <<<"$meter_json")
+  panel=$(jq -r 'if .panel == true then "true" else "false" end' <<<"$meter_json")
+  phone=$(jq -r 'if .phone == true then "true" else "false" end' <<<"$meter_json")
+  icon=$(jq -r '.icon // ""' <<<"$meter_json")
+  hide_json=$(jq -c '.hide // []' <<<"$meter_json")
+
+  local rc="1" out=""
+  [ -f "$outbase.rc" ] && rc=$(cat "$outbase.rc")
+  [ -f "$outbase.out" ] && out=$(cat "$outbase.out")
+
+  local status="fail" reason=""
+  if [ "$rc" = "124" ]; then
+    reason="timeout"
+  else
+    local parses="false" ok_val=""
+    if [ -n "$out" ] && printf '%s' "$out" | jq -e . >/dev/null 2>&1 \
+        && printf '%s' "$out" | jq -e '(.ok == true) or (.ok == false)' >/dev/null 2>&1; then
+      parses="true"
+      ok_val=$(jq -r '.ok' <<<"$out")
+    fi
+    if [ "$parses" = "true" ]; then
+      if [ "$ok_val" = "true" ] && [ "$rc" = "0" ]; then
+        status="ok"
+      else
+        reason=$(jq -r '.reason // "provider failed"' <<<"$out")
+      fi
+    elif [ "$rc" != "0" ] || [ -z "$out" ]; then
+      reason="provider failed"
+    else
+      reason="invalid output"
+    fi
+  fi
+
+  local sub_json
+  if [ -z "$sub_raw" ]; then sub_json=null; else sub_json=$(jq -Rn --arg s "$sub_raw" '$s'); fi
+
+  if [ "$status" = "ok" ]; then
+    local plan_json source_json age full_bars eff_ts filtered_bars
+    if [ "$type" = "claude" ]; then plan_json=null; else plan_json=$(jq -c '.plan // null' <<<"$out"); fi
+    source_json=$(jq -c '.source // null' <<<"$out")
+    age=$(jq -r '.age // 0' <<<"$out")
+
+    full_bars=$(jq -n --argjson now "$now" --arg type "$type" --argjson d "$out" "$JQ_BARS_PROGRAM")
+
+    eff_ts=$((now - age))
+    jq -n --argjson ts "$eff_ts" --argjson bars "$full_bars" --argjson source "$source_json" --argjson plan "$plan_json" \
+      '{ts: $ts, bars: $bars, source: $source, plan: $plan}' | atomic_write "$LAST_GOOD_DIR/$id.json" 0644
+
+    filtered_bars=$(jq -c --argjson hide "$hide_json" '[.[] | select(.k as $k | ($hide | index($k)) | not)]' <<<"$full_bars")
+
+    jq -n --arg id "$id" --arg type "$type" --arg label "$label" --argjson sub "$sub_json" \
+      --argjson panel "$panel" --argjson phone "$phone" --arg icon "$icon" \
+      --argjson ok true --argjson source "$source_json" --argjson age "$age" \
+      --argjson plan "$plan_json" --argjson reason null --argjson bars "$filtered_bars" \
+      '{id:$id,type:$type,label:$label,sub:$sub,panel:$panel,phone:$phone,icon:$icon,ok:$ok,source:$source,age:$age,plan:$plan,reason:$reason,bars:$bars}'
+    return 0
+  fi
+
+  if [ -f "$LAST_GOOD_DIR/$id.json" ]; then
+    local lg lg_ts lg_bars lg_source lg_plan age filtered_bars
+    lg=$(cat "$LAST_GOOD_DIR/$id.json")
+    lg_ts=$(jq -r '.ts' <<<"$lg")
+    lg_bars=$(jq -c '.bars' <<<"$lg")
+    lg_source=$(jq -c '.source' <<<"$lg")
+    lg_plan=$(jq -c '.plan' <<<"$lg")
+    age=$((now - lg_ts))
+    filtered_bars=$(jq -c --argjson hide "$hide_json" '[.[] | select(.k as $k | ($hide | index($k)) | not)]' <<<"$lg_bars")
+    jq -n --arg id "$id" --arg type "$type" --arg label "$label" --argjson sub "$sub_json" \
+      --argjson panel "$panel" --argjson phone "$phone" --arg icon "$icon" \
+      --argjson ok true --argjson source "$lg_source" --argjson age "$age" \
+      --argjson plan "$lg_plan" --arg reason "$reason" --argjson bars "$filtered_bars" \
+      '{id:$id,type:$type,label:$label,sub:$sub,panel:$panel,phone:$phone,icon:$icon,ok:$ok,source:$source,age:$age,plan:$plan,reason:$reason,bars:$bars}'
+    return 0
+  fi
+
+  jq -n --arg id "$id" --arg type "$type" --arg label "$label" --argjson sub "$sub_json" \
+    --argjson panel "$panel" --argjson phone "$phone" --arg icon "$icon" \
+    --argjson ok false --argjson source null --argjson age 0 \
+    --argjson plan null --arg reason "$reason" --argjson bars '[]' \
+    '{id:$id,type:$type,label:$label,sub:$sub,panel:$panel,phone:$phone,icon:$icon,ok:$ok,source:$source,age:$age,plan:$plan,reason:$reason,bars:$bars}'
+}
+
+do_collect() {
+  mkdir_state
+  local now; now=$(date +%s)
+  local config_json; config_json=$(config_get_effective)
+  local config_hash; config_hash=$(printf '%s' "$config_json" | sha256sum | cut -d' ' -f1)
+  local meters_count; meters_count=$(jq '.meters | length' <<<"$config_json")
+
+  local tmpd; tmpd=$(mktemp -d "$STATE_DIR/.collect.XXXXXX")
+
+  local i meter_json id type opts_json
+  for (( i = 0; i < meters_count; i++ )); do
+    meter_json=$(jq -c ".meters[$i]" <<<"$config_json")
+    id=$(jq -r '.id' <<<"$meter_json")
+    type=$(jq -r '.type' <<<"$meter_json")
+    opts_json=$(jq -c '.opts // {}' <<<"$meter_json")
+    launch_provider "$type" "$opts_json" "$tmpd/$id"
+  done
+  wait
+
+  local meters_arr="[]" meter_obj
+  for (( i = 0; i < meters_count; i++ )); do
+    meter_json=$(jq -c ".meters[$i]" <<<"$config_json")
+    id=$(jq -r '.id' <<<"$meter_json")
+    meter_obj=$(process_meter "$meter_json" "$tmpd/$id" "$now")
+    meters_arr=$(jq -c --argjson m "$meter_obj" '. + [$m]' <<<"$meters_arr")
+  done
+  rm -rf "$tmpd"
+
+  local snapshot
+  snapshot=$(jq -n --argjson now "$now" --argjson meters "$meters_arr" '{v: 2, ts: $now, meters: $meters}')
+  printf '%s\n' "$snapshot" | atomic_write "$SNAPSHOT_FILE" 0644
+  jq -n --arg hash "$config_hash" --argjson at "$now" '{config_hash: $hash, collected_at: $at}' \
+    | atomic_write "$META_FILE" 0644
+  printf '%s\n' "$snapshot"
+}
+
+snapshot_is_fresh() {
+  local max_age="$1" now="$2"
+  [ -f "$SNAPSHOT_FILE" ] && [ -f "$META_FILE" ] || return 1
+  local collected_at; collected_at=$(jq -r '.collected_at // empty' "$META_FILE" 2>/dev/null)
+  [ -n "$collected_at" ] || return 1
+  local age=$(( now - collected_at ))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$max_age" ] || return 1
+  local stored_hash cur_hash cur_config
+  stored_hash=$(jq -r '.config_hash // empty' "$META_FILE" 2>/dev/null)
+  cur_config=$(config_get_effective)
+  cur_hash=$(printf '%s' "$cur_config" | sha256sum | cut -d' ' -f1)
+  [ "$stored_hash" = "$cur_hash" ]
+}
+
+do_snapshot() {
+  local max_age="$1"
+  mkdir_state
+  local now; now=$(date +%s)
+  if snapshot_is_fresh "$max_age" "$now"; then
+    cat "$SNAPSHOT_FILE"
+    return 0
+  fi
+  (
+    flock 9
+    local inner_now; inner_now=$(date +%s)
+    if snapshot_is_fresh "$max_age" "$inner_now"; then
+      cat "$SNAPSHOT_FILE"
+    else
+      do_collect
+    fi
+  ) 9>"$LOCK_FILE"
+}
+
+do_collect_locked() {
+  mkdir_state
+  ( flock 9; do_collect ) 9>"$LOCK_FILE"
+}
+
+# ================= push =================
+
+b64url_str() { printf '%s' "$1" | openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+b64url_stdin() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+get_fcm_token() {
+  local sa_path="$1"
+  [ -r "$sa_path" ] || return 1
+  local now; now=$(date +%s)
+
+  if [ -f "$TOKEN_CACHE_FILE" ]; then
+    local cached_tok cached_exp
+    cached_tok=$(jq -r '.access_token // empty' "$TOKEN_CACHE_FILE" 2>/dev/null)
+    cached_exp=$(jq -r '.expires_at // 0' "$TOKEN_CACHE_FILE" 2>/dev/null)
+    if [ -n "$cached_tok" ] && [ "$now" -lt "$(( cached_exp - 300 ))" ]; then
+      printf '%s' "$cached_tok"
+      return 0
+    fi
+  fi
+
+  local client_email private_key token_uri
+  client_email=$(jq -r '.client_email // empty' "$sa_path")
+  private_key=$(jq -r '.private_key // empty' "$sa_path")
+  token_uri=$(jq -r '.token_uri // empty' "$sa_path")
+  [ -n "$client_email" ] && [ -n "$private_key" ] && [ -n "$token_uri" ] || return 1
+
+  local target_url="${AI_METER_TOKEN_URL:-$token_uri}"
+
+  local header claims h_b64 c_b64 unsigned sig_b64 jwt
+  header='{"alg":"RS256","typ":"JWT"}'
+  claims=$(jq -n --arg iss "$client_email" --arg aud "$token_uri" --argjson iat "$now" --argjson exp "$(( now + 3600 ))" \
+    '{iss: $iss, scope: "https://www.googleapis.com/auth/firebase.messaging", aud: $aud, iat: $iat, exp: $exp}')
+  h_b64=$(b64url_str "$header")
+  c_b64=$(b64url_str "$claims")
+  unsigned="$h_b64.$c_b64"
+  sig_b64=$(printf '%s' "$unsigned" | openssl dgst -sha256 -sign <(printf '%s' "$private_key") | b64url_stdin)
+  jwt="$unsigned.$sig_b64"
+
+  local resp access_token expires_in
+  resp=$("$CURL" -sS --fail -X POST "$target_url" \
+    -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$jwt") || return 1
+  access_token=$(jq -r '.access_token // empty' <<<"$resp")
+  expires_in=$(jq -r '.expires_in // 3600' <<<"$resp")
+  [ -n "$access_token" ] || return 1
+
+  jq -n --arg t "$access_token" --argjson e "$(( now + expires_in ))" '{access_token: $t, expires_at: $e}' \
+    | atomic_write "$TOKEN_CACHE_FILE" 0600
+  printf '%s' "$access_token"
+}
+
+do_push() {
+  local force="$1"
+  [ -f "$PUSH_CONFIG_FILE" ] || return 0
+  mkdir_state
+
+  local push_cfg project_id topic sa_path
+  push_cfg=$(cat "$PUSH_CONFIG_FILE")
+  project_id=$(jq -r '.projectId // empty' <<<"$push_cfg")
+  topic=$(jq -r '.topic // empty' <<<"$push_cfg")
+  sa_path=$(jq -r '.serviceAccount // empty' <<<"$push_cfg")
+  sa_path="${sa_path/#\~/$HOME}"
+
+  local snapshot_json; snapshot_json=$(do_snapshot 60)
+
+  local payload_json
+  payload_json=$(jq -c '{v, ts, meters: [.meters[] | select(.phone == true) | {id,type,label,sub,ok,source,age,plan,reason,bars}]}' \
+    <<<"$snapshot_json")
+
+  local normalized
+  normalized=$(jq -c '.ts = null | .meters |= (map(.age = null) | map(.bars |= map(.reset_at = null)))' <<<"$payload_json")
+
+  local prev_state="" prev_norm="null" prev_sent_at=0
+  if [ -f "$PUSH_STATE_FILE" ]; then
+    prev_state=$(cat "$PUSH_STATE_FILE")
+    prev_norm=$(jq -c '.payload // null' <<<"$prev_state")
+    prev_sent_at=$(jq -r '.sent_at // 0' <<<"$prev_state")
+  fi
+
+  local now; now=$(date +%s)
+  local changed="false"
+  [ "$prev_norm" != "$normalized" ] && changed="true"
+  local elapsed=$(( now - prev_sent_at ))
+  local heartbeat="false"
+  [ "$elapsed" -ge 900 ] && heartbeat="true"
+
+  local should_send="false" status_line=""
+  if [ "$force" = "1" ]; then
+    should_send="true"; status_line="push: sent (forced)"
+  elif [ "$changed" = "true" ]; then
+    should_send="true"; status_line="push: sent (changed)"
+  elif [ "$heartbeat" = "true" ]; then
+    should_send="true"; status_line="push: sent (heartbeat)"
+  else
+    status_line="push: skipped (unchanged)"
+  fi
+
+  if [ "$should_send" != "true" ]; then
+    log_err "$status_line"
+    return 0
+  fi
+
+  local payload_str payload_bytes
+  payload_str=$(jq -c . <<<"$payload_json")
+  payload_bytes=$(printf '%s' "$payload_str" | wc -c)
+  if [ "$payload_bytes" -ge 3500 ]; then
+    log_err "push: error payload too large (${payload_bytes} bytes, limit 3500)"
+    return 1
+  fi
+
+  local access_token
+  access_token=$(get_fcm_token "$sa_path")
+  if [ -z "$access_token" ]; then
+    log_err "push: error obtaining FCM access token"
+    return 1
+  fi
+
+  local send_body
+  send_body=$(jq -n --arg topic "$topic" --arg p "$payload_str" \
+    '{message: {topic: $topic, data: {p: $p}, android: {priority: "high", ttl: "900s", collapse_key: "meters"}}}')
+
+  local fcm_base="${AI_METER_FCM_URL:-https://fcm.googleapis.com}"
+  local fcm_url="$fcm_base/v1/projects/$project_id/messages:send"
+
+  if ! "$CURL" -sS --fail -X POST -H "Authorization: Bearer $access_token" -H "Content-Type: application/json" \
+      -d "$send_body" "$fcm_url" >/dev/null; then
+    log_err "push: error FCM send failed"
+    return 1
+  fi
+
+  jq -n --argjson sent_at "$now" --argjson payload "$normalized" '{sent_at: $sent_at, payload: $payload}' \
+    | atomic_write "$PUSH_STATE_FILE" 0644
+
+  log_err "$status_line"
+}
+
+# ================= CLI =================
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  snapshot)
+    max_age=60
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --max-age) max_age="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ -n "${AI_METER_FIXTURE:-}" ]; then
+      cat "$AI_METER_FIXTURE"
+      exit 0
+    fi
+    do_snapshot "$max_age"
+    ;;
+
+  collect)
+    if [ -n "${AI_METER_FIXTURE:-}" ]; then
+      cat "$AI_METER_FIXTURE"
+      exit 0
+    fi
+    do_collect_locked
+    ;;
+
+  push)
+    force=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --force) force=1; shift ;;
+        *) shift ;;
+      esac
+    done
+    do_push "$force"
+    ;;
+
+  config)
+    subcmd="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "$subcmd" in
+      get) config_get ;;
+      set)
+        b64=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --b64) b64="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        do_config_set "$b64"
+        ;;
+      init) do_config_init ;;
+      *)
+        log_err "usage: ai-meter config <get|set|init>"
+        exit 2
+        ;;
+    esac
+    ;;
+
+  profiles)
+    bash "$PROVIDERS_DIR/claude.sh" --list-profiles
+    ;;
+
+  *)
+    log_err "usage: ai-meter <snapshot|collect|push|config|profiles> [args]"
+    exit 2
+    ;;
+esac

@@ -1,0 +1,6 @@
+[Unit]
+Description=ai-meter push
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ai-meter push

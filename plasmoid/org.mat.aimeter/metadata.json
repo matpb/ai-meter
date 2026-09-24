@@ -1,0 +1,21 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "org.mat.aimeter",
+        "Name": "AI Meter",
+        "Description": "Every AI subscription meter in one panel widget",
+        "Icon": "aimeter",
+        "Authors": [
+            {
+                "Name": "Mathieu-Philippe Bourgeois",
+                "Email": ""
+            }
+        ],
+        "Website": "https://matpb.com",
+        "Category": "System Information",
+        "License": "MIT",
+        "Version": "1.0.0",
+        "EnabledByDefault": true
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
