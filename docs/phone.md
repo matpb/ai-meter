@@ -1,9 +1,9 @@
-# Phone (Pocket Meter)
+# Phone (AI Meter for Android)
 
-Pocket Meter is the Android home-screen widget, in [`android/`](../android/). It shows whichever
-meters you mark `phone: true` in AI Meter's config, and it's updated by push, not polling: no
-persistent notification, no VPN, no always-on connection. Android just wakes the app when a message
-arrives.
+AI Meter for Android is the Android home-screen widget, in [`android/`](../android/). It shows
+whichever meters you mark `phone: true` in AI Meter's config, and it's updated by push, not
+polling: no persistent notification, no VPN, no always-on connection. Android just wakes the app
+when a message arrives.
 
 It's fed over Firebase Cloud Messaging (FCM), against **your own** Firebase project: nobody else's
 build of the app can send to it, and nothing about your usage goes through anyone's server but
@@ -24,7 +24,7 @@ you'll use it below as `your-project-id`.
 ## 2. Register the Android app
 
 ```bash
-firebase apps:create ANDROID --package-name org.mat.pocketmeter --project your-project-id
+firebase apps:create ANDROID --package-name org.mat.aimeter --project your-project-id
 ```
 
 Download its config file and put it where the Android build expects it:
@@ -101,8 +101,7 @@ Install the APK on your phone (`adb install app-debug.apk`, or copy it over and 
 **open the app once**: that's what subscribes the device to the FCM topic. Widgets on Android only
 receive messages for topics the app has actively subscribed to.
 
-Add the "Pocket Meter" widget to your home screen (long-press home screen → Widgets → Pocket
-Meter).
+Add the "AI Meter" widget to your home screen (long-press home screen → Widgets → AI Meter).
 
 Back on the desktop, enable the push timer if `install.sh` didn't already (it only enables it when
 `push.json` exists):

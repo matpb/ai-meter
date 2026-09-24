@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "pocket-meter"
+rootProject.name = "ai-meter"
 include(":app")

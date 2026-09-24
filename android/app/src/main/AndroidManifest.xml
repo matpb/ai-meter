@@ -4,12 +4,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
-        android:name=".PocketMeterApp"
+        android:name=".AiMeterApp"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.PocketMeter">
+        android:theme="@style/Theme.AiMeter">
 
         <activity
             android:name=".MainActivity"
@@ -21,7 +21,7 @@
         </activity>
 
         <service
-            android:name=".fcm.PocketMeterMessagingService"
+            android:name=".fcm.AiMeterMessagingService"
             android:exported="false">
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
@@ -29,14 +29,14 @@
         </service>
 
         <receiver
-            android:name=".widget.PocketMeterWidgetReceiver"
+            android:name=".widget.AiMeterWidgetReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
-                android:resource="@xml/pocket_meter_widget_info" />
+                android:resource="@xml/ai_meter_widget_info" />
         </receiver>
 
     </application>

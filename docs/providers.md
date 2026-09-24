@@ -2,7 +2,7 @@
 
 Each provider script is invoked as `bash providers/<type>.sh` and prints one line of JSON to stdout.
 `ai-meter` sets the env vars documented per-provider below (from a meter's `opts`) for that single
-invocation, reads stdout, and maps the result onto snapshot bars — see `docs/contract.md` for the bar
+invocation, reads stdout, and maps the result onto snapshot bars: see `docs/contract.md` for the bar
 mapping table. This file documents what each script actually reads and how it falls back.
 
 ## claude.sh
@@ -49,7 +49,7 @@ Reads current OpenAI Codex usage.
 
 - **Primary**: the ChatGPT usage endpoint. Always fresh, account-wide (Codex CLI, ChatGPT desktop app,
   Codex Cloud) and free (a read endpoint). Auth is the OAuth bearer token the Codex CLI stores in
-  `~/.codex/auth.json` after `codex login` — no browser, no cookie decryption, no keyring.
+  `~/.codex/auth.json` after `codex login`: no browser, no cookie decryption, no keyring.
 - **Fallback**: the newest session rollout at `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Codex
   writes a `rate_limits` block there on every turn, via a `token_count` event, so this needs no setup.
   Its shape differs from the HTTP one (`primary`/`secondary` instead of `*_window`, `window_minutes`

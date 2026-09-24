@@ -1,20 +1,31 @@
 # AI Meter
 
 A KDE Plasma 6 panel widget that shows **every AI subscription meter** you have: any number of
-Claude accounts, OpenAI Codex, SuperGrok, Cursor: as compact bars, plus an optional Android
-home-screen widget ("Pocket Meter") fed by push, with an optional in-app refresh button that
-pokes the desktop for an immediate update (see [`docs/phone.md`](docs/phone.md)).
+Claude accounts, OpenAI Codex, SuperGrok and Cursor, as compact bars.
 
 <img src="docs/screenshots/panel.png" alt="AI Meter in the panel" width="420">
 
-One collector, shared by the panel and the phone job, so provider APIs get polled once no matter
-how many surfaces are watching. Read-only status checks: zero tokens spent, zero prompts sent.
+One collector, shared by the panel and the optional phone job, so provider APIs get polled once no
+matter how many surfaces are watching. Read-only status checks: zero tokens spent, zero prompts
+sent.
 
-<img src="docs/screenshots/popup.png" alt="AI Meter detail popup" width="420">
+<img src="docs/screenshots/popup.png" alt="AI Meter detail popup" width="320"> <img src="docs/screenshots/phone.png" alt="AI Meter for Android" width="320">
 
-AI Meter supersedes four earlier single-provider widgets (Claude Meter, Codex Meter, Grok Meter,
-Cursor Meter) and the standalone Pocket Meter app. See [Migrating](#migrating-from-the-old-widgets)
-below if you're coming from one of those.
+AI Meter supersedes four earlier single-provider widgets: Claude Meter, Codex Meter, Grok Meter,
+and Cursor Meter. See [Migrating](#migrating-from-the-old-widgets) below if you're coming from one
+of those.
+
+## Two ways to use it
+
+1. **Desktop widget** (this is the whole point of the project): `./install.sh`, done. No accounts,
+   no cloud, no Firebase. Everything runs locally and only talks to each provider's own API.
+2. **Phone widget** (optional, separate from the desktop widget): a home-screen widget on Android
+   that mirrors your meters. It needs **your own** free Firebase project (Spark plan, no billing
+   required), because pushes go through Firebase Cloud Messaging and the optional refresh button
+   goes through Realtime Database. You build the APK yourself with your own `google-services.json`;
+   takes about fifteen minutes. There is no shared server and no prebuilt APK to download: the APK
+   embeds your Firebase config and your refresh key, so it can only ever be built per person. See
+   [`docs/phone.md`](docs/phone.md).
 
 ## Supported providers
 
@@ -118,22 +129,19 @@ contract (paths, config schema, snapshot schema, push payload): [`docs/contract.
 
 ## Phone (optional)
 
-An Android home-screen widget, "Pocket Meter", fed by Firebase Cloud Messaging: no persistent
-notification, no VPN, no always-on connection. Set-up is a bit more involved (your own Firebase
-project): see [`docs/phone.md`](docs/phone.md).
+An Android home-screen widget fed by Firebase Cloud Messaging: no persistent notification, no VPN,
+no always-on connection. Set-up is a bit more involved than the desktop widget since it needs your
+own Firebase project: see [`docs/phone.md`](docs/phone.md).
 
 ## Migrating from the old widgets
 
-If you're coming from Claude Meter, Codex Meter, Grok Meter, Cursor Meter, or Pocket Meter:
+If you're coming from Claude Meter, Codex Meter, Grok Meter, or Cursor Meter:
 
 1. Install AI Meter (above).
 2. Recreate each subscription in **Configure → Meters**. A second Claude account maps to its own
    Claude Code directory (e.g. `~/.claude-work`) and Chrome profile, same as it did before.
 3. Remove the old widget(s) from your panel (right-click → Remove).
 4. Uninstall each old widget with its own `uninstall.sh` in its repo.
-5. If you used Pocket Meter: its hub timer and ntfy/UnifiedPush wiring are no longer needed. AI
-   Meter's phone widget uses its own Firebase project and FCM topic instead: see
-   [`docs/phone.md`](docs/phone.md).
 
 ## Privacy
 
