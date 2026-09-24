@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AI Meter uninstaller: removes the plasmoid, the ai-meter symlink and the push timer.
+# AI Meter uninstaller: removes the plasmoid, the ai-meter symlink and the push/listen services.
 # Never touches ~/.config/ai-meter/.
 set -uo pipefail
 
@@ -17,14 +17,14 @@ usage() {
     cat <<'EOF'
 Usage: uninstall.sh [OPTIONS]
 
-Removes the AI Meter plasmoid, the ai-meter CLI symlink and the push timer.
+Removes the AI Meter plasmoid, the ai-meter CLI symlink and the push timer/listen service.
 Your config, accounts and cached state under ~/.config/ai-meter/ and
 ~/.local/state/ai-meter/ are left in place.
 
 Options:
   --no-plasma    Skip kpackagetool6/plasmashell; just remove the copied
                  plasmoid directory.
-  --no-systemd   Skip disabling/removing the systemd --user push timer.
+  --no-systemd   Skip disabling/removing the systemd --user push timer and listen service.
   --help, -h     Show this help and exit.
 EOF
 }
@@ -62,6 +62,9 @@ else
     say "Removing the push timer..."
     systemctl --user disable --now ai-meter-push.timer >/dev/null 2>&1 || true
     rm -f "$SYSTEMD_USER_DIR/ai-meter-push.service" "$SYSTEMD_USER_DIR/ai-meter-push.timer"
+    say "Removing the listen service..."
+    systemctl --user disable --now ai-meter-listen.service >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_USER_DIR/ai-meter-listen.service"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
 fi
 

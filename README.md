@@ -2,7 +2,8 @@
 
 A KDE Plasma 6 panel widget that shows **every AI subscription meter** you have: any number of
 Claude accounts, OpenAI Codex, SuperGrok, Cursor: as compact bars, plus an optional Android
-home-screen widget ("Pocket Meter") fed by push.
+home-screen widget ("Pocket Meter") fed by push, with an optional in-app refresh button that
+pokes the desktop for an immediate update (see [`docs/phone.md`](docs/phone.md)).
 
 <img src="docs/screenshots/panel.png" alt="AI Meter in the panel" width="420">
 

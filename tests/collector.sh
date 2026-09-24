@@ -55,6 +55,8 @@ new_env() {
   unset AI_METER_TEST_COUNTER AI_METER_TEST_ENVFILE
   unset MB_CURL_FAIL MB_CURL_TOKEN_COUNT MB_CURL_SEND_COUNT
   unset MB_CURL_TOKEN_ASSERTION MB_CURL_SEND_BODY MB_CURL_ACCESS_TOKEN MB_CURL_EXPIRES_IN
+  unset AI_METER_LISTEN_MAX_CONNECTS AI_METER_RECONNECT_DELAY AI_METER_NOW_MS
+  unset MB_CURL_ARGV_LOG MB_CURL_SSE_DIR MB_CURL_SSE_CONNECT_COUNT MB_CURL_SSE_AUTH_LOG
 }
 
 write_config() { printf '%s' "$2" > "$1/config.json"; }
@@ -81,6 +83,17 @@ write_push_config() {
   local dir="$1" sa_path="$2" topic="${3:-meters}"
   jq -n --arg pid "proj1" --arg sa "$sa_path" --arg topic "$topic" \
     '{projectId: $pid, serviceAccount: $sa, topic: $topic}' > "$dir/push.json"
+}
+
+write_listen_push_config() {
+  local dir="$1" sa_path="$2" topic="$3" db_url="$4" refresh_key="$5"
+  jq -n --arg pid "proj1" --arg sa "$sa_path" --arg topic "$topic" --arg db "$db_url" --arg key "$refresh_key" \
+    '{projectId: $pid, serviceAccount: $sa, topic: $topic, databaseUrl: $db, refreshKey: $key}' > "$dir/push.json"
+}
+
+sse_event() {
+  local val="$1"
+  printf 'event: put\ndata: {"path":"/","data":%s}\n\n' "$val"
 }
 
 CLAUDE_CFG='{"v":1,"meters":[{"id":"m1","type":"claude","label":"Claude","sub":"","panel":true,"phone":true,"hide":[],"icon":"","opts":{}}]}'
@@ -470,7 +483,9 @@ test_push_jwt_signature_valid() {
   h=$(cut -d. -f1 <<<"$jwt"); b=$(cut -d. -f2 <<<"$jwt"); s=$(cut -d. -f3 <<<"$jwt")
   local claims; claims=$(decode_b64url "$b")
   check "$(jq -r '.iss' <<<"$claims")" "svc@example-project.iam.gserviceaccount.com" "iss" || return 1
-  check "$(jq -r '.scope' <<<"$claims")" "https://www.googleapis.com/auth/firebase.messaging" "scope" || return 1
+  check "$(jq -r '.scope' <<<"$claims")" \
+    "https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email" \
+    "scope" || return 1
   check "$(jq -r '.aud' <<<"$claims")" "https://oauth2.example.test/token" "aud" || return 1
   local iat exp; iat=$(jq -r '.iat' <<<"$claims"); exp=$(jq -r '.exp' <<<"$claims")
   [ "$((exp - iat))" -eq 3600 ] || { ERR="exp-iat != 3600 (iat=$iat exp=$exp)"; return 1; }
@@ -624,6 +639,251 @@ test_push_payload_too_large() {
   return 0
 }
 
+# ================= listen =================
+
+test_listen_not_configured_exits_0() {
+  local d; new_env; d="$ENV_DIR"
+  rm -f "$d/push.json"
+  local out; out=$("$MB" listen 2>"$d/stderr.txt")
+  local rc=$?
+  check "$rc" "0" "exit code" || return 1
+  [ -z "$out" ] || { ERR="stdout not empty: $out"; return 1; }
+  [ -s "$d/stderr.txt" ] || { ERR="expected one stderr line"; return 1; }
+  return 0
+}
+
+test_listen_ignores_initial_stale_event() {
+  local d; new_env; d="$ENV_DIR"
+  write_config "$d" "$CLAUDE_CFG"
+  make_service_account "$d"
+  write_listen_push_config "$d" "$d/sa.json" "meters" "https://example-db.firebaseio.com" "aaaa1111aaaa1111aaaa1111aaaa1111"
+
+  local ssedir="$d/sse"; mkdir -p "$ssedir"
+  local now_ms=2000000000000
+  sse_event "$(( now_ms - 200000 ))" > "$ssedir/1"
+
+  export AI_METER_CURL="$CURL_STUB"
+  export MB_CURL_SSE_DIR="$ssedir"
+  export MB_CURL_SSE_CONNECT_COUNT="$d/sse-connects"
+  export AI_METER_LISTEN_MAX_CONNECTS=1
+  export AI_METER_RECONNECT_DELAY=0
+  export AI_METER_NOW_MS="$now_ms"
+  export AI_METER_TEST_MODE=ok
+  export AI_METER_TEST_COUNTER="$d/counter.txt"
+  export MB_CURL_SEND_COUNT="$d/send-hits"
+
+  "$MB" listen >/dev/null 2>"$d/stderr.txt"
+  local rc=$?
+  unset AI_METER_CURL MB_CURL_SSE_DIR MB_CURL_SSE_CONNECT_COUNT AI_METER_LISTEN_MAX_CONNECTS \
+    AI_METER_RECONNECT_DELAY AI_METER_NOW_MS AI_METER_TEST_MODE AI_METER_TEST_COUNTER MB_CURL_SEND_COUNT
+
+  check "$rc" "0" "exit code" || return 1
+  [ ! -f "$d/counter.txt" ] || { ERR="collect ran on stale event"; return 1; }
+  [ ! -f "$d/send-hits" ] || { ERR="push sent on stale event"; return 1; }
+  grep -q "ignored stale" "$d/stderr.txt" || { ERR="stderr: $(cat "$d/stderr.txt")"; return 1; }
+  return 0
+}
+
+test_listen_handles_new_request() {
+  local d; new_env; d="$ENV_DIR"
+  write_config "$d" "$CLAUDE_CFG"
+  make_service_account "$d"
+  write_listen_push_config "$d" "$d/sa.json" "meters" "https://example-db.firebaseio.com" "bbbb2222bbbb2222bbbb2222bbbb2222"
+
+  local ssedir="$d/sse"; mkdir -p "$ssedir"
+  local now_ms=2000000000000
+  sse_event "$(( now_ms - 1000 ))" > "$ssedir/1"
+
+  export AI_METER_CURL="$CURL_STUB"
+  export MB_CURL_SSE_DIR="$ssedir"
+  export MB_CURL_SSE_CONNECT_COUNT="$d/sse-connects"
+  export AI_METER_LISTEN_MAX_CONNECTS=1
+  export AI_METER_RECONNECT_DELAY=0
+  export AI_METER_NOW_MS="$now_ms"
+  export AI_METER_TEST_MODE=ok
+  export AI_METER_TEST_COUNTER="$d/counter.txt"
+  export MB_CURL_SEND_COUNT="$d/send-hits"
+
+  "$MB" listen >/dev/null 2>"$d/stderr.txt"
+  local rc=$?
+  unset AI_METER_CURL MB_CURL_SSE_DIR MB_CURL_SSE_CONNECT_COUNT AI_METER_LISTEN_MAX_CONNECTS \
+    AI_METER_RECONNECT_DELAY AI_METER_NOW_MS AI_METER_TEST_MODE AI_METER_TEST_COUNTER MB_CURL_SEND_COUNT
+
+  check "$rc" "0" "exit code" || return 1
+  [ -f "$d/counter.txt" ] || { ERR="collect did not run: $(cat "$d/stderr.txt")"; return 1; }
+  [ -f "$d/send-hits" ] || { ERR="push did not send: $(cat "$d/stderr.txt")"; return 1; }
+  grep -q "handled refresh request" "$d/stderr.txt" || { ERR="stderr: $(cat "$d/stderr.txt")"; return 1; }
+  return 0
+}
+
+test_listen_honours_recent_request_on_connect() {
+  local d; new_env; d="$ENV_DIR"
+  write_config "$d" "$CLAUDE_CFG"
+  make_service_account "$d"
+  write_listen_push_config "$d" "$d/sa.json" "meters" "https://example-db.firebaseio.com" "cccc3333cccc3333cccc3333cccc3333"
+
+  local ssedir="$d/sse"; mkdir -p "$ssedir"
+  local now_ms=2000000000000
+  sse_event "$(( now_ms - 500000 ))" > "$ssedir/1"
+  sse_event "$(( now_ms - 2000 ))" > "$ssedir/2"
+
+  export AI_METER_CURL="$CURL_STUB"
+  export MB_CURL_SSE_DIR="$ssedir"
+  export MB_CURL_SSE_CONNECT_COUNT="$d/sse-connects"
+  export AI_METER_LISTEN_MAX_CONNECTS=2
+  export AI_METER_RECONNECT_DELAY=0
+  export AI_METER_NOW_MS="$now_ms"
+  export AI_METER_TEST_MODE=ok
+  export AI_METER_TEST_COUNTER="$d/counter.txt"
+  export MB_CURL_SEND_COUNT="$d/send-hits"
+
+  "$MB" listen >/dev/null 2>"$d/stderr.txt"
+  unset AI_METER_CURL MB_CURL_SSE_DIR MB_CURL_SSE_CONNECT_COUNT AI_METER_LISTEN_MAX_CONNECTS \
+    AI_METER_RECONNECT_DELAY AI_METER_NOW_MS AI_METER_TEST_MODE AI_METER_TEST_COUNTER MB_CURL_SEND_COUNT
+
+  local count; count=$(wc -l < "$d/counter.txt" 2>/dev/null || echo 0)
+  check "$count" "1" "collect ran only for the recent event" || return 1
+  grep -q "ignored stale" "$d/stderr.txt" || { ERR="missing stale log: $(cat "$d/stderr.txt")"; return 1; }
+  grep -q "handled refresh request" "$d/stderr.txt" || { ERR="missing handled log: $(cat "$d/stderr.txt")"; return 1; }
+  return 0
+}
+
+test_listen_rate_limits_within_10s() {
+  local d; new_env; d="$ENV_DIR"
+  write_config "$d" "$CLAUDE_CFG"
+  make_service_account "$d"
+  write_listen_push_config "$d" "$d/sa.json" "meters" "https://example-db.firebaseio.com" "dddd4444dddd4444dddd4444dddd4444"
+
+  local ssedir="$d/sse"; mkdir -p "$ssedir"
+  local now_ms=2000000000000
+  local val1=$(( now_ms - 3000 )) val2=$(( now_ms - 1000 ))
+  { sse_event "$val1"; sse_event "$val2"; } > "$ssedir/1"
+
+  export AI_METER_CURL="$CURL_STUB"
+  export MB_CURL_SSE_DIR="$ssedir"
+  export AI_METER_LISTEN_MAX_CONNECTS=1
+  export AI_METER_RECONNECT_DELAY=0
+  export AI_METER_NOW_MS="$now_ms"
+  export AI_METER_TEST_MODE=ok
+  export AI_METER_TEST_COUNTER="$d/counter.txt"
+  export MB_CURL_SEND_COUNT="$d/send-hits"
+
+  "$MB" listen >/dev/null 2>"$d/stderr.txt"
+  unset AI_METER_CURL MB_CURL_SSE_DIR AI_METER_LISTEN_MAX_CONNECTS AI_METER_RECONNECT_DELAY \
+    AI_METER_NOW_MS AI_METER_TEST_MODE AI_METER_TEST_COUNTER MB_CURL_SEND_COUNT
+
+  local count; count=$(wc -l < "$d/counter.txt" 2>/dev/null || echo 0)
+  check "$count" "1" "collect ran once, second event rate-limited" || return 1
+  grep -q "rate-limited" "$d/stderr.txt" || { ERR="stderr: $(cat "$d/stderr.txt")"; return 1; }
+  check "$(cat "$d/state/refresh-last")" "$val2" "refresh-last records the skipped value too" || return 1
+  return 0
+}
+
+test_listen_reconnects_after_auth_revoked() {
+  local d; new_env; d="$ENV_DIR"
+  write_config "$d" "$CLAUDE_CFG"
+  make_service_account "$d"
+  write_listen_push_config "$d" "$d/sa.json" "meters" "https://example-db.firebaseio.com" "eeee5555eeee5555eeee5555eeee5555"
+
+  local ssedir="$d/sse"; mkdir -p "$ssedir"
+  printf 'event: auth_revoked\ndata: null\n\n' > "$ssedir/1"
+
+  export AI_METER_CURL="$CURL_STUB"
+  export MB_CURL_SSE_DIR="$ssedir"
+  export MB_CURL_SSE_CONNECT_COUNT="$d/sse-connects"
+  export AI_METER_LISTEN_MAX_CONNECTS=2
+  export AI_METER_RECONNECT_DELAY=0
+  export AI_METER_NOW_MS=2000000000000
+
+  "$MB" listen >/dev/null 2>"$d/stderr.txt"
+  local rc=$?
+  unset AI_METER_CURL MB_CURL_SSE_DIR MB_CURL_SSE_CONNECT_COUNT AI_METER_LISTEN_MAX_CONNECTS \
+    AI_METER_RECONNECT_DELAY AI_METER_NOW_MS
+
+  check "$rc" "0" "exit code" || return 1
+  local count; count=$(wc -l < "$d/sse-connects" 2>/dev/null || echo 0)
+  check "$count" "2" "two SSE connections" || return 1
+  return 0
+}
+
+test_listen_ignores_keepalive() {
+  local d; new_env; d="$ENV_DIR"
+  write_config "$d" "$CLAUDE_CFG"
+  make_service_account "$d"
+  write_listen_push_config "$d" "$d/sa.json" "meters" "https://example-db.firebaseio.com" "ffff6666ffff6666ffff6666ffff6666"
+
+  local ssedir="$d/sse"; mkdir -p "$ssedir"
+  printf 'event: keep-alive\ndata: null\n\n' > "$ssedir/1"
+
+  export AI_METER_CURL="$CURL_STUB"
+  export MB_CURL_SSE_DIR="$ssedir"
+  export AI_METER_LISTEN_MAX_CONNECTS=1
+  export AI_METER_RECONNECT_DELAY=0
+  export AI_METER_NOW_MS=2000000000000
+  export AI_METER_TEST_MODE=ok
+  export AI_METER_TEST_COUNTER="$d/counter.txt"
+
+  "$MB" listen >/dev/null 2>"$d/stderr.txt"
+  unset AI_METER_CURL MB_CURL_SSE_DIR AI_METER_LISTEN_MAX_CONNECTS AI_METER_RECONNECT_DELAY \
+    AI_METER_NOW_MS AI_METER_TEST_MODE AI_METER_TEST_COUNTER
+
+  [ ! -f "$d/counter.txt" ] || { ERR="collect ran on keep-alive"; return 1; }
+  return 0
+}
+
+test_token_scopes_include_database() {
+  local d; new_env; d="$ENV_DIR"
+  write_config "$d" "$CLAUDE_CFG"
+  make_service_account "$d"
+  write_push_config "$d" "$d/sa.json" "meters"
+  export AI_METER_CURL="$CURL_STUB"
+  export MB_CURL_TOKEN_ASSERTION="$d/assertion.txt"
+  "$MB" push --force >/dev/null 2>"$d/stderr.txt"
+  unset AI_METER_CURL MB_CURL_TOKEN_ASSERTION
+  [ -s "$d/assertion.txt" ] || { ERR="no assertion captured: $(cat "$d/stderr.txt")"; return 1; }
+  local jwt b claims
+  jwt=$(cat "$d/assertion.txt")
+  b=$(cut -d. -f2 <<<"$jwt")
+  claims=$(decode_b64url "$b")
+  check "$(jq -r '.scope' <<<"$claims")" \
+    "https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email" \
+    "scope" || return 1
+  return 0
+}
+
+test_secrets_not_in_argv() {
+  local d; new_env; d="$ENV_DIR"
+  write_config "$d" "$CLAUDE_CFG"
+  make_service_account "$d"
+  local refresh_key="c0ffee00c0ffee00c0ffee00c0ffee00"
+  write_listen_push_config "$d" "$d/sa.json" "meters" "https://example-db.firebaseio.com" "$refresh_key"
+
+  export AI_METER_CURL="$CURL_STUB"
+  export MB_CURL_ARGV_LOG="$d/argv.log"
+  export MB_CURL_ACCESS_TOKEN="SUPERSECRETACCESSTOKEN99"
+  "$MB" push --force >/dev/null 2>"$d/push.err"
+
+  local ssedir="$d/sse"; mkdir -p "$ssedir"
+  local now_ms=2000000000000
+  sse_event "$(( now_ms - 1000 ))" > "$ssedir/1"
+  export MB_CURL_SSE_DIR="$ssedir"
+  export AI_METER_LISTEN_MAX_CONNECTS=1
+  export AI_METER_RECONNECT_DELAY=0
+  export AI_METER_NOW_MS="$now_ms"
+  export AI_METER_TEST_MODE=ok
+  "$MB" listen >/dev/null 2>"$d/listen.err"
+
+  unset AI_METER_CURL MB_CURL_ARGV_LOG MB_CURL_ACCESS_TOKEN MB_CURL_SSE_DIR AI_METER_LISTEN_MAX_CONNECTS \
+    AI_METER_RECONNECT_DELAY AI_METER_NOW_MS AI_METER_TEST_MODE
+
+  [ -s "$d/argv.log" ] || { ERR="no argv captured"; return 1; }
+  grep -qF "SUPERSECRETACCESSTOKEN99" "$d/argv.log" && { ERR="access token leaked into argv"; return 1; }
+  grep -qF "$refresh_key" "$d/argv.log" && { ERR="refresh key leaked into argv"; return 1; }
+  grep -qF "assertion=" "$d/argv.log" && { ERR="jwt assertion leaked into argv"; return 1; }
+  grep -qiF "bearer" "$d/argv.log" && { ERR="bearer header leaked into argv"; return 1; }
+  return 0
+}
+
 # ================= run =================
 
 run mapping_claude test_mapping_claude
@@ -657,6 +917,16 @@ run push_sends_on_change test_push_sends_on_change
 run push_force test_push_force
 run push_heartbeat_after_900s test_push_heartbeat_after_900s
 run push_payload_too_large test_push_payload_too_large
+
+run listen_not_configured_exits_0 test_listen_not_configured_exits_0
+run listen_ignores_initial_stale_event test_listen_ignores_initial_stale_event
+run listen_handles_new_request test_listen_handles_new_request
+run listen_honours_recent_request_on_connect test_listen_honours_recent_request_on_connect
+run listen_rate_limits_within_10s test_listen_rate_limits_within_10s
+run listen_reconnects_after_auth_revoked test_listen_reconnects_after_auth_revoked
+run listen_ignores_keepalive test_listen_ignores_keepalive
+run token_scopes_include_database test_token_scopes_include_database
+run secrets_not_in_argv test_secrets_not_in_argv
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT" >&2
 [ "$FAIL_COUNT" -eq 0 ]

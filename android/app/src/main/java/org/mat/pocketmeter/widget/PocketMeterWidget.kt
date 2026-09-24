@@ -18,6 +18,7 @@ import androidx.glance.action.actionStartActivity
 import androidx.glance.action.clickable
 import androidx.glance.appwidget.GlanceAppWidget
 import androidx.glance.appwidget.SizeMode
+import androidx.glance.appwidget.action.actionRunCallback
 import androidx.glance.appwidget.lazy.LazyColumn
 import androidx.glance.appwidget.lazy.items
 import androidx.glance.appwidget.provideContent
@@ -43,11 +44,14 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import org.mat.pocketmeter.MainActivity
 import org.mat.pocketmeter.Prefs
+import org.mat.pocketmeter.RefreshConfig
 import org.mat.pocketmeter.core.Bar
 import org.mat.pocketmeter.core.Meter
 import org.mat.pocketmeter.core.Payload
+import org.mat.pocketmeter.core.RefreshStatus
 import org.mat.pocketmeter.core.barValueLabel
 import org.mat.pocketmeter.core.computeBarWidthDp
+import org.mat.pocketmeter.core.computeRefreshStatus
 import org.mat.pocketmeter.core.displayLabel
 import org.mat.pocketmeter.core.drawPaceBar
 import org.mat.pocketmeter.core.formatAgeShort
@@ -88,6 +92,17 @@ class PocketMeterWidget : GlanceAppWidget() {
 
 @Composable
 private fun WidgetContent(payload: Payload?) {
+    val context = LocalContext.current
+    val refreshStatus = if (RefreshConfig.enabled) {
+        computeRefreshStatus(
+            Prefs.getRefreshRequestedAt(context),
+            payload?.ts,
+            System.currentTimeMillis(),
+        )
+    } else {
+        RefreshStatus.Idle
+    }
+
     Column(
         modifier = GlanceModifier
             .fillMaxSize()
@@ -95,22 +110,37 @@ private fun WidgetContent(payload: Payload?) {
             .padding(8.dp)
             .clickable(actionStartActivity(MainActivity::class.java))
     ) {
-        if (payload == null) {
-            Text("Waiting for hub…", style = TextStyle(color = fgMuted))
-            return@Column
+        val now = System.currentTimeMillis() / 1000
+        val stale = payload?.let { isPayloadStale(it.ts, now) } ?: false
+        val baseHeaderText = if (payload == null) {
+            "Waiting for hub…"
+        } else {
+            val updated = ZonedDateTime.ofInstant(Instant.ofEpochSecond(payload.ts), ZoneId.systemDefault())
+            if (stale) "stale · ${updated.format(hhmm)}" else "updated ${updated.format(hhmm)}"
+        }
+        val statusSuffix = when (refreshStatus) {
+            RefreshStatus.Pending -> " · refreshing…"
+            RefreshStatus.NoReply -> " · no reply"
+            RefreshStatus.Idle -> ""
+        }
+        val headerColor = if (stale || payload == null) fgMuted else fgLight
+
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = GlanceModifier.fillMaxWidth()) {
+            Text(
+                "$baseHeaderText$statusSuffix",
+                style = TextStyle(color = headerColor, fontWeight = FontWeight.Bold),
+                modifier = GlanceModifier.defaultWeight(),
+            )
+            if (RefreshConfig.enabled) {
+                Text(
+                    "⟳",
+                    style = TextStyle(color = fgLight, fontWeight = FontWeight.Bold),
+                    modifier = GlanceModifier.clickable(actionRunCallback<RefreshAction>()),
+                )
+            }
         }
 
-        val now = System.currentTimeMillis() / 1000
-        val stale = isPayloadStale(payload.ts, now)
-        val updated = ZonedDateTime.ofInstant(Instant.ofEpochSecond(payload.ts), ZoneId.systemDefault())
-        val headerText = if (stale) "stale · ${updated.format(hhmm)}" else "updated ${updated.format(hhmm)}"
-        val headerColor = if (stale) fgMuted else fgLight
-
-        Text(
-            headerText,
-            style = TextStyle(color = headerColor, fontWeight = FontWeight.Bold),
-            modifier = GlanceModifier.fillMaxWidth(),
-        )
+        if (payload == null) return@Column
         Spacer(modifier = GlanceModifier.size(4.dp))
 
         LazyColumn(modifier = GlanceModifier.fillMaxSize()) {

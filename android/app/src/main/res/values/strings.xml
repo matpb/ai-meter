@@ -1,3 +1,4 @@
 <resources>
-    <string name="app_name">Pocket Meter</string>
+    <string name="app_name">AI Meter</string>
+    <string name="widget_description">Live usage bars pushed from your desktop collector.</string>
 </resources>

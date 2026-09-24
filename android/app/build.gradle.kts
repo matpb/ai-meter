@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -14,13 +16,23 @@ android {
         applicationId = "org.mat.pocketmeter"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 3
+        versionName = "0.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         val aiMeterTopic = (project.findProperty("aiMeterTopic") as String?) ?: "meters"
         buildConfigField("String", "FCM_TOPIC", "\"$aiMeterTopic\"")
+
+        // Falls back to local.properties so the key never needs to live in a committed file.
+        val localProps = Properties().apply {
+            val localFile = rootProject.file("local.properties")
+            if (localFile.exists()) localFile.inputStream().use { load(it) }
+        }
+        val aiMeterRefreshKey = (project.findProperty("aiMeterRefreshKey") as String?)
+            ?: localProps.getProperty("aiMeterRefreshKey")
+            ?: ""
+        buildConfigField("String", "REFRESH_KEY", "\"$aiMeterRefreshKey\"")
     }
 
     buildTypes {
@@ -60,6 +72,9 @@ dependencies {
 
     implementation(platform("com.google.firebase:firebase-bom:34.14.0"))
     implementation("com.google.firebase:firebase-messaging")
+    implementation("com.google.firebase:firebase-database")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.10.2")
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")

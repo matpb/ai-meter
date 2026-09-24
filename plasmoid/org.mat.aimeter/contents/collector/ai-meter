@@ -16,6 +16,7 @@ LOCK_FILE="$STATE_DIR/collect.lock"
 LAST_GOOD_DIR="$STATE_DIR/last-good"
 PUSH_STATE_FILE="$STATE_DIR/push-state.json"
 TOKEN_CACHE_FILE="$STATE_DIR/fcm-token.json"
+REFRESH_LAST_FILE="$STATE_DIR/refresh-last"
 
 CURL="${AI_METER_CURL:-curl}"
 TIMEOUT_S="${AI_METER_TIMEOUT:-40}"
@@ -392,16 +393,26 @@ do_collect_locked() {
 b64url_str() { printf '%s' "$1" | openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 b64url_stdin() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 
+FCM_DB_SCOPE="https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email"
+
+# Runs curl with url/headers/data passed via -K stdin config, never argv (keeps tokens/keys out of ps).
+# $1 = config text (lines like: url = "…", header = "…", data = "…" | "@file"), rest = extra curl flags.
+curl_k() {
+  local config="$1"; shift
+  printf '%s' "$config" | "$CURL" "$@" -K -
+}
+
 get_fcm_token() {
   local sa_path="$1"
   [ -r "$sa_path" ] || return 1
   local now; now=$(date +%s)
 
   if [ -f "$TOKEN_CACHE_FILE" ]; then
-    local cached_tok cached_exp
+    local cached_tok cached_exp cached_scope
     cached_tok=$(jq -r '.access_token // empty' "$TOKEN_CACHE_FILE" 2>/dev/null)
     cached_exp=$(jq -r '.expires_at // 0' "$TOKEN_CACHE_FILE" 2>/dev/null)
-    if [ -n "$cached_tok" ] && [ "$now" -lt "$(( cached_exp - 300 ))" ]; then
+    cached_scope=$(jq -r '.scope // empty' "$TOKEN_CACHE_FILE" 2>/dev/null)
+    if [ -n "$cached_tok" ] && [ "$cached_scope" = "$FCM_DB_SCOPE" ] && [ "$now" -lt "$(( cached_exp - 300 ))" ]; then
       printf '%s' "$cached_tok"
       return 0
     fi
@@ -417,22 +428,25 @@ get_fcm_token() {
 
   local header claims h_b64 c_b64 unsigned sig_b64 jwt
   header='{"alg":"RS256","typ":"JWT"}'
-  claims=$(jq -n --arg iss "$client_email" --arg aud "$token_uri" --argjson iat "$now" --argjson exp "$(( now + 3600 ))" \
-    '{iss: $iss, scope: "https://www.googleapis.com/auth/firebase.messaging", aud: $aud, iat: $iat, exp: $exp}')
+  claims=$(jq -n --arg iss "$client_email" --arg aud "$token_uri" --arg scope "$FCM_DB_SCOPE" \
+    --argjson iat "$now" --argjson exp "$(( now + 3600 ))" \
+    '{iss: $iss, scope: $scope, aud: $aud, iat: $iat, exp: $exp}')
   h_b64=$(b64url_str "$header")
   c_b64=$(b64url_str "$claims")
   unsigned="$h_b64.$c_b64"
   sig_b64=$(printf '%s' "$unsigned" | openssl dgst -sha256 -sign <(printf '%s' "$private_key") | b64url_stdin)
   jwt="$unsigned.$sig_b64"
 
-  local resp access_token expires_in
-  resp=$("$CURL" -sS --fail -X POST "$target_url" \
-    -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$jwt") || return 1
+  local resp access_token expires_in cfg
+  cfg=$(printf 'url = "%s"\nrequest = "POST"\ndata = "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=%s"\n' \
+    "$target_url" "$jwt")
+  resp=$(curl_k "$cfg" -sS --fail) || return 1
   access_token=$(jq -r '.access_token // empty' <<<"$resp")
   expires_in=$(jq -r '.expires_in // 3600' <<<"$resp")
   [ -n "$access_token" ] || return 1
 
-  jq -n --arg t "$access_token" --argjson e "$(( now + expires_in ))" '{access_token: $t, expires_at: $e}' \
+  jq -n --arg t "$access_token" --argjson e "$(( now + expires_in ))" --arg scope "$FCM_DB_SCOPE" \
+    '{access_token: $t, expires_at: $e, scope: $scope}' \
     | atomic_write "$TOKEN_CACHE_FILE" 0600
   printf '%s' "$access_token"
 }
@@ -510,16 +524,159 @@ do_push() {
   local fcm_base="${AI_METER_FCM_URL:-https://fcm.googleapis.com}"
   local fcm_url="$fcm_base/v1/projects/$project_id/messages:send"
 
-  if ! "$CURL" -sS --fail -X POST -H "Authorization: Bearer $access_token" -H "Content-Type: application/json" \
-      -d "$send_body" "$fcm_url" >/dev/null; then
+  local body_file; body_file=$(mktemp "$STATE_DIR/.send.XXXXXX")
+  printf '%s' "$send_body" > "$body_file"
+  chmod 600 "$body_file"
+  local send_cfg
+  send_cfg=$(printf 'url = "%s"\nrequest = "POST"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\ndata-binary = "@%s"\n' \
+    "$fcm_url" "$access_token" "$body_file")
+  if ! curl_k "$send_cfg" -sS --fail >/dev/null; then
+    rm -f "$body_file"
     log_err "push: error FCM send failed"
     return 1
   fi
+  rm -f "$body_file"
 
   jq -n --argjson sent_at "$now" --argjson payload "$normalized" '{sent_at: $sent_at, payload: $payload}' \
     | atomic_write "$PUSH_STATE_FILE" 0644
 
   log_err "$status_line"
+}
+
+# ================= listen =================
+
+now_ms() {
+  if [ -n "${AI_METER_NOW_MS:-}" ]; then
+    printf '%s' "$AI_METER_NOW_MS"
+  else
+    date +%s%3N
+  fi
+}
+
+listen_configured() {
+  [ -f "$PUSH_CONFIG_FILE" ] || return 1
+  local push_cfg db_url refresh_key
+  push_cfg=$(cat "$PUSH_CONFIG_FILE")
+  db_url=$(jq -r '.databaseUrl // empty' <<<"$push_cfg")
+  refresh_key=$(jq -r '.refreshKey // empty' <<<"$push_cfg")
+  [ -n "$db_url" ] && [ -n "$refresh_key" ]
+}
+
+# Applies one parsed refresh request ($1 = request time in ms). Mutates globals last_handled/last_run_epoch.
+process_refresh_event() {
+  local val_ms="$1"
+  case "$val_ms" in ''|*[!0-9]*) return 0 ;; esac
+
+  if [ "$val_ms" -le "$last_handled" ]; then
+    return 0
+  fi
+
+  local nowms age_ms
+  nowms=$(now_ms)
+  age_ms=$(( nowms - val_ms ))
+  if [ "$age_ms" -gt 120000 ]; then
+    log_err "listen: ignored stale request ($(( age_ms / 1000 ))s old)"
+    return 0
+  fi
+
+  last_handled="$val_ms"
+  printf '%s' "$val_ms" | atomic_write "$REFRESH_LAST_FILE" 0600
+
+  local now_epoch since_last_run
+  now_epoch=$(( nowms / 1000 ))
+  since_last_run=$(( now_epoch - last_run_epoch ))
+  if [ "$last_run_epoch" -gt 0 ] && [ "$since_last_run" -lt 10 ]; then
+    log_err "listen: rate-limited, skipping refresh request"
+    return 0
+  fi
+
+  last_run_epoch="$now_epoch"
+  do_collect_locked >/dev/null
+  do_push 1
+  log_err "listen: handled refresh request"
+}
+
+do_listen() {
+  if ! listen_configured; then
+    log_err "listen: not configured (push.json missing databaseUrl/refreshKey), exiting"
+    exit 0
+  fi
+  mkdir_state
+
+  local push_cfg db_url refresh_key sa_path
+  push_cfg=$(cat "$PUSH_CONFIG_FILE")
+  db_url=$(jq -r '.databaseUrl' <<<"$push_cfg")
+  refresh_key=$(jq -r '.refreshKey' <<<"$push_cfg")
+  sa_path=$(jq -r '.serviceAccount // empty' <<<"$push_cfg")
+  sa_path="${sa_path/#\~/$HOME}"
+
+  local last_handled=0
+  if [ -f "$REFRESH_LAST_FILE" ]; then
+    last_handled=$(cat "$REFRESH_LAST_FILE" 2>/dev/null)
+    case "$last_handled" in ''|*[!0-9]*) last_handled=0 ;; esac
+  fi
+  local last_run_epoch=0
+
+  local reconnect_delay="${AI_METER_RECONNECT_DELAY:-5}"
+  local max_connects="${AI_METER_LISTEN_MAX_CONNECTS:-0}"
+  local connects=0
+
+  while :; do
+    if [ "$max_connects" -gt 0 ] && [ "$connects" -ge "$max_connects" ]; then
+      return 0
+    fi
+    connects=$((connects + 1))
+
+    local access_token; access_token=$(get_fcm_token "$sa_path")
+    if [ -z "$access_token" ]; then
+      log_err "listen: error obtaining access token"
+      if [ "$max_connects" -gt 0 ] && [ "$connects" -ge "$max_connects" ]; then
+        return 0
+      fi
+      sleep "$reconnect_delay"
+      continue
+    fi
+
+    local sse_url="$db_url/refresh/$refresh_key.json"
+    local sse_cfg
+    sse_cfg=$(printf 'url = "%s"\nheader = "Accept: text/event-stream"\nheader = "Authorization: Bearer %s"\n' \
+      "$sse_url" "$access_token")
+
+    local event_name=""
+    while IFS= read -r line; do
+      case "$line" in
+        event:*)
+          event_name="${line#event:}"
+          event_name="${event_name# }"
+          ;;
+        data:*)
+          local data_str="${line#data:}"
+          data_str="${data_str# }"
+          case "$event_name" in
+            put|patch)
+              local path val
+              path=$(jq -r '.path // empty' <<<"$data_str" 2>/dev/null)
+              val=$(jq -r '.data' <<<"$data_str" 2>/dev/null)
+              if [ "$path" = "/" ]; then
+                process_refresh_event "$val"
+              fi
+              ;;
+            cancel|auth_revoked)
+              rm -f "$TOKEN_CACHE_FILE"
+              ;;
+            *) ;;
+          esac
+          event_name=""
+          ;;
+        *) ;;
+      esac
+    done < <(curl_k "$sse_cfg" -sS -N --max-time 3300)
+
+    if [ "$max_connects" -gt 0 ] && [ "$connects" -ge "$max_connects" ]; then
+      return 0
+    fi
+    sleep "$reconnect_delay"
+  done
 }
 
 # ================= CLI =================
@@ -589,8 +746,12 @@ case "$cmd" in
     bash "$PROVIDERS_DIR/claude.sh" --list-profiles
     ;;
 
+  listen)
+    do_listen
+    ;;
+
   *)
-    log_err "usage: ai-meter <snapshot|collect|push|config|profiles> [args]"
+    log_err "usage: ai-meter <snapshot|collect|push|config|profiles|listen> [args]"
     exit 2
     ;;
 esac

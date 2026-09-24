@@ -121,6 +121,90 @@ Check `journalctl --user -u ai-meter-push.service` for the one-line status
 (`push: sent (forced)` / `push: skipped (unchanged)` / an error), and the widget on your phone
 should refresh within a few seconds.
 
+## Refresh from the phone (optional)
+
+By default the widget updates whenever the desktop's push timer fires (every couple of minutes) or the
+snapshot changes. If you want a "refresh now" button on the phone that pokes the desktop immediately,
+set up a tiny unauthenticated Realtime Database path the app writes to and the desktop watches.
+
+### 1. Create the Realtime Database
+
+In the [Firebase console](https://console.firebase.google.com): your project → Build → Realtime Database
+→ Create Database. Or via the REST API:
+
+```bash
+curl -X POST \
+  "https://firebasedatabase.googleapis.com/v1beta/projects/your-project-id/locations/us-central1/instances?databaseId=your-project-id-default-rtdb" \
+  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "DEFAULT_DATABASE"}'
+```
+
+### 2. Grant the push service account read access
+
+```bash
+gcloud projects add-iam-policy-binding your-project-id \
+  --member="serviceAccount:ai-meter-push@your-project-id.iam.gserviceaccount.com" \
+  --role="roles/firebasedatabase.viewer"
+```
+
+### 3. Generate a refresh key and deploy rules
+
+```bash
+openssl rand -hex 16
+```
+
+Copy [`firebase/database.rules.template.json`](../firebase/database.rules.template.json), replace
+`REPLACE_WITH_REFRESH_KEY` with the key you just generated, then deploy it:
+
+```bash
+firebase deploy --only database --project your-project-id
+```
+
+The rules deny all reads and writes except a write of the server timestamp to exactly
+`refresh/<your key>` (see [`contract.md`](contract.md#refresh-from-the-phone-rtdb-contract)).
+
+### 4. Re-download `google-services.json`
+
+It needs to contain `firebase_url` now that a Realtime Database exists:
+
+```bash
+firebase apps:sdkconfig ANDROID <app-id> --project your-project-id --out android/app/google-services.json
+```
+
+### 5. Add the fields to `push.json` and to the Android build
+
+```bash
+jq --arg db "https://your-project-id-default-rtdb.firebaseio.com" --arg key "<your key>" \
+  '.databaseUrl = $db | .refreshKey = $key' ~/.config/ai-meter/push.json > /tmp/push.json.new \
+  && mv /tmp/push.json.new ~/.config/ai-meter/push.json
+chmod 600 ~/.config/ai-meter/push.json
+```
+
+Before building the APK, put the same key in `android/local.properties`:
+
+```
+aiMeterRefreshKey=<your key>
+```
+
+Rebuild (step 6 above) so the app bakes the key into the refresh button's write call.
+
+### 6. Enable the listen service
+
+```bash
+systemctl --user enable --now ai-meter-listen.service
+```
+
+`install.sh` does this automatically when `push.json` already has both fields at install time.
+
+### Security model
+
+The refresh key is a shared secret baked into your own APK, not a public credential: the database
+rules reject any write to `refresh/<key>` from anyone who doesn't have it. Worst case if it leaked,
+someone could trigger extra collections, which are already rate-limited to one per 10 seconds.
+
+No personal data goes through this path: it carries a single timestamp, nothing else.
+
 ## Troubleshooting
 
 - **Widget never updates**: reopen the app once (re-subscribes to the topic), then re-run
@@ -131,3 +215,6 @@ should refresh within a few seconds.
   turn a few off in **Configure → Meters**.
 - **Nothing in `journalctl`**: confirm the timer is active with
   `systemctl --user list-timers ai-meter-push.timer`.
+- **Refresh button does nothing**: confirm `ai-meter-listen.service` is running
+  (`systemctl --user status ai-meter-listen.service`) and that `refreshKey` matches
+  `aiMeterRefreshKey` in the built APK.

@@ -1,0 +1,11 @@
+[Unit]
+Description=ai-meter listen (phone-triggered refresh)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ai-meter listen
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

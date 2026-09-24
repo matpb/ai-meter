@@ -4,6 +4,7 @@ import android.content.SharedPreferences
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -11,28 +12,39 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.mat.pocketmeter.core.Bar
 import org.mat.pocketmeter.core.Payload
+import org.mat.pocketmeter.core.RefreshStatus
 import org.mat.pocketmeter.core.barValueLabel
+import org.mat.pocketmeter.core.computeRefreshStatus
 import org.mat.pocketmeter.core.displayLabel
 import org.mat.pocketmeter.core.drawPaceBar
 import org.mat.pocketmeter.core.formatAgeShort
@@ -51,6 +63,8 @@ data class PrefsSnapshot(
     val subAt: Long?,
     val payloadJson: String?,
     val payloadReceivedAt: Long?,
+    val refreshRequestedAt: Long?,
+    val refreshError: String?,
 )
 
 class MainActivity : ComponentActivity() {
@@ -58,6 +72,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         setContent {
             MaterialTheme {
                 Surface {
@@ -72,6 +87,8 @@ class MainActivity : ComponentActivity() {
         subAt = Prefs.getSubAt(this),
         payloadJson = Prefs.getPayloadJson(this),
         payloadReceivedAt = Prefs.getPayloadReceivedAt(this),
+        refreshRequestedAt = Prefs.getRefreshRequestedAt(this),
+        refreshError = Prefs.getRefreshError(this),
     )
 
     // Prefs are written from PocketMeterMessagingService, a different component, so the
@@ -116,11 +133,30 @@ private fun PocketMeterScreen(activity: MainActivity, onRetry: () -> Unit) {
         ZonedDateTime.ofInstant(Instant.ofEpochSecond(it), ZoneId.systemDefault()).format(timestampFormat)
     } ?: "never"
 
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var sending by remember { mutableStateOf(false) }
+
+    // Recomposition otherwise only happens on prefs writes, so a request that never gets
+    // answered would stay "Pending" forever; wake up once at the 60s mark to flip to NoReply.
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(snapshot.refreshRequestedAt) {
+        if (snapshot.refreshRequestedAt != null) {
+            delay(61_000)
+            now = System.currentTimeMillis()
+        }
+    }
+    val refreshStatus = computeRefreshStatus(snapshot.refreshRequestedAt, payload?.ts, now)
+
     Column(
-        modifier = Modifier.fillMaxWidth().padding(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .safeDrawingPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("Pocket Meter", style = MaterialTheme.typography.headlineSmall)
+        Text("AI Meter", style = MaterialTheme.typography.headlineSmall)
         Text(
             "A desktop collector pushes usage to this device over FCM; nothing here polls or connects out.",
             style = MaterialTheme.typography.bodySmall,
@@ -132,6 +168,34 @@ private fun PocketMeterScreen(activity: MainActivity, onRetry: () -> Unit) {
         }
 
         Text("Last payload received: $lastReceivedText", style = MaterialTheme.typography.bodySmall)
+
+        if (RefreshConfig.enabled) {
+            Button(
+                enabled = !sending,
+                onClick = {
+                    scope.launch {
+                        sending = true
+                        try {
+                            requestRefresh(context)
+                        } finally {
+                            sending = false
+                        }
+                    }
+                },
+            ) { Text("Refresh now") }
+            when {
+                sending -> Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.height(16.dp).width(16.dp))
+                    Text("Sending…", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 8.dp))
+                }
+                refreshStatus == RefreshStatus.Pending -> Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.height(16.dp).width(16.dp))
+                    Text("Asking the desktop…", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 8.dp))
+                }
+                refreshStatus == RefreshStatus.NoReply -> Text("Desktop didn't answer. Is it on?", style = MaterialTheme.typography.bodySmall)
+            }
+            snapshot.refreshError?.let { Text("Error: $it", style = MaterialTheme.typography.bodySmall) }
+        }
 
         Text("Meters", style = MaterialTheme.typography.titleMedium)
         if (payload == null) {

@@ -91,27 +91,28 @@ A bar whose source object is null is omitted.
 - `sub: ""` in config → `null` here.
 - Order = config order.
 
-## CLI (`ai-meter`)
-
-| Command | Behaviour | stdout |
-|---|---|---|
-| `snapshot [--max-age N]` | Return `<state>/snapshot.json` if younger than N s (default 60) and collected from the current config; else collect under an exclusive `flock`, re-checking freshness after the lock is acquired. | snapshot JSON, one line |
-| `collect` | Collect now, ignore age. | snapshot JSON |
-| `push [--force]` | Exit 0 silently if no push config. Else `snapshot --max-age 60`, then send via FCM when changed, forced, or 900 s since the last send. | one status line on stderr |
-| `config get` | Print the config (auto-detected one if no file; not written). | config JSON |
-| `config set` | Read config JSON from stdin, or from `--b64 <base64>`. Validate, write atomically (0600). Exit 2 on invalid. | nothing |
-| `config init` | Write the auto-detected config if no file exists. | config JSON |
-| `profiles` | Proxy `providers/claude.sh --list-profiles`. | `[{"path","label"}]` |
-
-Test hook: `AI_METER_FIXTURE=<file>` makes `snapshot`/`collect` print that file verbatim, with no provider calls and no state written.
-
 ## push.json and the FCM message
 
 ```json
-{ "projectId": "your-project", "serviceAccount": "~/.config/ai-meter/fcm-service-account.json", "topic": "meters" }
+{
+  "projectId": "your-project",
+  "serviceAccount": "~/.config/ai-meter/fcm-service-account.json",
+  "topic": "meters",
+  "databaseUrl": "https://your-project-default-rtdb.firebaseio.com",
+  "refreshKey": "32 hex chars"
+}
 ```
 
-- Auth: service-account JWT (RS256 via `openssl`, scope `https://www.googleapis.com/auth/firebase.messaging`) exchanged at the key's `token_uri`; access token cached in `<state>/fcm-token.json` (0600) until 5 min before expiry.
+- `projectId`, `serviceAccount`, `topic`: required, see below.
+- `databaseUrl`, `refreshKey`: optional. Both present enables `ai-meter listen` (phone-triggered refresh);
+  either missing and `listen` exits 0 with a one-line notice. See the RTDB contract below and
+  [`phone.md`](phone.md#refresh-from-the-phone-optional) for setup.
+
+- Auth: service-account JWT (RS256 via `openssl`) exchanged at the key's `token_uri` for an access token
+  scoped `https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/firebase.database
+  https://www.googleapis.com/auth/userinfo.email` (one token serves both FCM and RTDB); cached in
+  `<state>/fcm-token.json` (0600, includes the scope string so a token cached under old scopes is a cache miss)
+  until 5 min before expiry.
 - Send: `POST https://fcm.googleapis.com/v1/projects/<projectId>/messages:send`
 
 ```json
@@ -123,3 +124,39 @@ Test hook: `AI_METER_FIXTURE=<file>` makes `snapshot`/`collect` print that file 
 - Phone payload = the snapshot with only `phone: true` meters, and per meter only `id,type,label,sub,ok,source,age,plan,reason,bars`. Must stay under 3500 bytes; if larger, fail with a clear error.
 - Change detection ignores `ts`, `age`, `reset_at`.
 - Overrides for tests: `AI_METER_FCM_URL` (send URL prefix), `AI_METER_TOKEN_URL`, `AI_METER_CURL`.
+- The access token and any request body containing it never appear in argv (visible via `ps`): both the
+  token exchange and the FCM send pass URL/headers/body through `curl -K -` (config on stdin).
+
+## Refresh from the phone (RTDB contract)
+
+The Android app writes the server timestamp to one Realtime Database path when the user taps refresh:
+
+```
+PUT <databaseUrl>/refresh/<refreshKey>.json
+body: {".sv": "timestamp"}
+```
+
+Database rules (see `firebase/database.rules.template.json`) reject everything except a write of `now` to
+exactly that path, unauthenticated. `ai-meter listen` holds a streaming (SSE) `GET` on that same path,
+authenticated with the same OAuth token as FCM, and on a genuinely new value runs `collect` then
+`push --force` so the phone widget updates within seconds. See `listen` in the CLI table below.
+
+## CLI (`ai-meter`)
+
+| Command | Behaviour | stdout |
+|---|---|---|
+| `snapshot [--max-age N]` | Return `<state>/snapshot.json` if younger than N s (default 60) and collected from the current config; else collect under an exclusive `flock`, re-checking freshness after the lock is acquired. | snapshot JSON, one line |
+| `collect` | Collect now, ignore age. | snapshot JSON |
+| `push [--force]` | Exit 0 silently if no push config. Else `snapshot --max-age 60`, then send via FCM when changed, forced, or 900 s since the last send. | one status line on stderr |
+| `listen` | Exit 0 with a one-line stderr notice if `push.json` lacks `databaseUrl`/`refreshKey`. Else hold an SSE connection on `<databaseUrl>/refresh/<refreshKey>.json`; on a fresh, non-stale request run `collect` (locked) then `push --force`, rate-limited to one real run per 10 s; reconnect after 5 s on disconnect/`cancel`/`auth_revoked`. Runs forever (meant for a systemd service). | one line per handled/skipped request on stderr |
+| `config get` | Print the config (auto-detected one if no file; not written). | config JSON |
+| `config set` | Read config JSON from stdin, or from `--b64 <base64>`. Validate, write atomically (0600). Exit 2 on invalid. | nothing |
+| `config init` | Write the auto-detected config if no file exists. | config JSON |
+| `profiles` | Proxy `providers/claude.sh --list-profiles`. | `[{"path","label"}]` |
+
+Test hook: `AI_METER_FIXTURE=<file>` makes `snapshot`/`collect` print that file verbatim, with no provider calls and no state written.
+
+`listen` test hooks: `AI_METER_LISTEN_MAX_CONNECTS=N` exits after N SSE connections instead of looping
+forever; `AI_METER_RECONNECT_DELAY` overrides the 5 s reconnect wait; `AI_METER_NOW_MS` overrides "now" (ms)
+for deterministic staleness/rate-limit checks; also reuses `AI_METER_CURL` and `AI_METER_TOKEN_URL`.
+The last handled request time (ms) is persisted at `<state>/refresh-last` (0600).

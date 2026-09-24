@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AI Meter installer for KDE Plasma 6: plasmoid + bundled collector, `ai-meter` CLI, optional push timer.
+# AI Meter installer for KDE Plasma 6: plasmoid + bundled collector, `ai-meter` CLI, optional push timer and listen service.
 # Idempotent.
 set -euo pipefail
 
@@ -20,12 +20,12 @@ usage() {
 Usage: install.sh [OPTIONS]
 
 Installs AI Meter: the KDE Plasma panel widget, the `ai-meter` CLI (symlinked
-into ~/.local/bin), and the optional push timer that feeds the phone widget.
+into ~/.local/bin), and the optional push timer and phone-refresh listen service.
 
 Options:
   --no-plasma    Skip kpackagetool6/plasmashell; copy the plasmoid package
                  directly into ~/.local/share/plasma/plasmoids/ instead.
-  --no-systemd   Skip installing and enabling the systemd --user push timer.
+  --no-systemd   Skip installing and enabling the systemd --user push timer and listen service.
   --help, -h     Show this help and exit.
 EOF
 }
@@ -119,6 +119,7 @@ else
     mkdir -p "$SYSTEMD_USER_DIR"
     cp "$HERE/systemd/ai-meter-push.service" "$SYSTEMD_USER_DIR/"
     cp "$HERE/systemd/ai-meter-push.timer" "$SYSTEMD_USER_DIR/"
+    cp "$HERE/systemd/ai-meter-listen.service" "$SYSTEMD_USER_DIR/"
     systemctl --user daemon-reload
 
     if [ -f "$CONFIG_DIR/push.json" ]; then
@@ -128,6 +129,17 @@ else
         warn "No $CONFIG_DIR/push.json yet -- the push timer is installed but not enabled."
         warn "Set up phone push (see docs/phone.md), then run:"
         warn "  systemctl --user enable --now ai-meter-push.timer"
+    fi
+
+    has_db_url=$(jq -r 'if (.databaseUrl // "") != "" then "1" else "" end' "$CONFIG_DIR/push.json" 2>/dev/null || true)
+    has_refresh_key=$(jq -r 'if (.refreshKey // "") != "" then "1" else "" end' "$CONFIG_DIR/push.json" 2>/dev/null || true)
+    if [ -n "$has_db_url" ] && [ -n "$has_refresh_key" ]; then
+        systemctl --user enable --now ai-meter-listen.service
+        say "Listen service enabled (found databaseUrl and refreshKey in $CONFIG_DIR/push.json)."
+    else
+        warn "No databaseUrl/refreshKey in $CONFIG_DIR/push.json yet -- the listen service is installed but not enabled."
+        warn "Set up phone refresh (see docs/phone.md), then run:"
+        warn "  systemctl --user enable --now ai-meter-listen.service"
     fi
 fi
 
