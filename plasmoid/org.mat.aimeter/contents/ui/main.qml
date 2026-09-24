@@ -458,7 +458,7 @@ PlasmoidItem {
     fullRepresentation: Item {
         Layout.minimumWidth: Kirigami.Units.gridUnit * 20
         // Minimum tracks the content (capped) so a remembered small popup size can't force scrolling.
-        Layout.minimumHeight: Math.min(Kirigami.Units.gridUnit * 56,
+        Layout.minimumHeight: Math.min(Kirigami.Units.gridUnit * 70,
             Math.max(Kirigami.Units.gridUnit * 16, sectionsCol.implicitHeight + Kirigami.Units.gridUnit * 6))
         Layout.preferredWidth: Kirigami.Units.gridUnit * 22
         Layout.preferredHeight: Layout.minimumHeight
@@ -510,14 +510,26 @@ PlasmoidItem {
                     id: sectionsCol
                     // Keep bar ends clear of the scrollbar.
                     width: parent.width - Kirigami.Units.gridUnit
-                    spacing: Kirigami.Units.largeSpacing
+                    spacing: 0
 
                     Repeater {
                         model: root.meters
-                        delegate: MeterSection {
+                        delegate: ColumnLayout {
                             required property var modelData
+                            required property int index
                             Layout.fillWidth: true
-                            meter: modelData
+                            spacing: Kirigami.Units.gridUnit * 0.9
+
+                            Kirigami.Separator {
+                                visible: index > 0
+                                Layout.fillWidth: true
+                                Layout.topMargin: Kirigami.Units.gridUnit * 0.9
+                                opacity: 0.5
+                            }
+                            MeterSection {
+                                Layout.fillWidth: true
+                                meter: modelData
+                            }
                         }
                     }
                 }

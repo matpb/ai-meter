@@ -23,6 +23,8 @@ import androidx.glance.appwidget.lazy.LazyColumn
 import androidx.glance.appwidget.lazy.items
 import androidx.glance.appwidget.provideContent
 import androidx.glance.background
+import androidx.glance.appwidget.cornerRadius
+import androidx.glance.layout.Box
 import androidx.glance.layout.Alignment
 import androidx.glance.layout.Column
 import androidx.glance.layout.ContentScale
@@ -132,11 +134,17 @@ private fun WidgetContent(payload: Payload?) {
                 modifier = GlanceModifier.defaultWeight(),
             )
             if (RefreshConfig.enabled) {
-                Text(
-                    "⟳",
-                    style = TextStyle(color = fgLight, fontWeight = FontWeight.Bold),
-                    modifier = GlanceModifier.clickable(actionRunCallback<RefreshAction>()),
-                )
+                // 44dp target: a bare glyph was small enough that taps fell through to "open app".
+                Box(
+                    modifier = GlanceModifier
+                        .size(44.dp)
+                        .cornerRadius(22.dp)
+                        .background(ColorProvider(Color(0x33FFFFFF)))
+                        .clickable(actionRunCallback<RefreshAction>()),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("⟳", style = TextStyle(color = fgLight, fontWeight = FontWeight.Bold, fontSize = 22.sp))
+                }
             }
         }
 
